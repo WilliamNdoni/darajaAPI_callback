@@ -1,6 +1,7 @@
 // Importing required modules
 const express = require('express');
 const mysql = require('mysql2');
+const mqtt = require('mqtt');
 require('dotenv').config();
 
 // Initializing the app
@@ -8,6 +9,34 @@ const app = express();
 
 // Configuring middleware for JSON
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// MQTT Setup
+const mqttOptions = {
+  host: '4761eba0b4eb4a958f76528215b690db.s1.eu.hivemq.cloud',
+  port: process.env.MQTT_PORT || 8883,
+  protocol: 'mqtts',
+  clientId: `mpesa_server_${Math.random().toString(16).slice(2, 8)}`,
+  username: process.env.MQTT_USERNAME,
+  password: process.env.MQTT_PASSWORD,
+  keepalive: 600,
+  reconnectPeriod: 1000,
+  connectTimeout: 30 * 1000,
+  clean: false
+};
+
+const client = mqtt.connect(mqttOptions);
+const topic = 'wuzu58mpesa_data';
+
+client.on('connect', () => {
+  console.log('Connected to MQTT broker');
+});
+
+client.on('error', (err) => {
+  console.error('MQTT connection error:', err);
+});
+
+
 
 // Create a database connection
 const db = mysql.createConnection({
@@ -35,7 +64,8 @@ app.post('/mpesa_confirmation', (req, res) => {
   const amount = data.TransAmount;
   const phone_no = data.MSISDN;
   const fname = data.FirstName;
-  const mname = data.MiddleName;
+  const mname = data.MiddleName || "Uknown";
+  const lname = data.LastName || "Uknown";
 
   console.log(fname, mname, phone_no, transaction_id, transaction_time);
 
@@ -49,6 +79,15 @@ app.post('/mpesa_confirmation', (req, res) => {
     }
 
     console.log('✅ Payment stored successfully.');
+    // Publishing to MQTT topic
+    client.publish(topic, JSON.stringify({ first_name:fname,amount: amount }), { qos: 1 }, (err) => {
+      if (err) {
+        console.log('Error publishing to MQTT:', err);
+      } else {
+        console.log('Transaction data published to MQTT');
+      }
+    });
+
     res.status(200).json({
       ResultCode: "0",
       ResultDesc: "Success"
