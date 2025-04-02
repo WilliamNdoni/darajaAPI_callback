@@ -27,6 +27,7 @@ db.connect((err) => {
       phone VARCHAR(20),
       fname VARCHAR(50),
       mname VARCHAR(50),
+      lname VARCHAR(50),
       timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`;
 

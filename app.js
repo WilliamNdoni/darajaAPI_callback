@@ -63,16 +63,20 @@ app.post('/mpesa_confirmation', (req, res) => {
   const transaction_time = data.TransTime;
   const amount = data.TransAmount;
   const phone_no = data.MSISDN;
-  const fname = data.FirstName;
+  const fname = data.FirstName || "Uknown";
   const mname = data.MiddleName || "Uknown";
   const lname = data.LastName || "Uknown";
 
   console.log(fname, mname, phone_no, transaction_id, transaction_time);
 
-  // Store transaction in database
-  const insertQuery = `INSERT INTO payments (transaction_id, amount, phone, fname, mname) VALUES (?, ?, ?, ?, ?)`;
+  // Calculate pump run time in milliseconds
+  const litres = amount / 60;
+  const pumpRunTimeMs = (litres / 0.02) * 1000; 
 
-  db.query(insertQuery, [transaction_id, amount, phone_no, fname, mname], (err, result) => {
+  // Store transaction in database
+  const insertQuery = `INSERT INTO payments (transaction_id, amount, phone, fname, mname, lname) VALUES (?, ?, ?, ?, ?, ?)`;
+
+  db.query(insertQuery, [transaction_id, amount, phone_no, fname, mname, lname], (err, result) => {
     if (err) {
       console.error('❌ Error inserting data:', err.message);
       return res.status(500).json({ ResultCode: "1", ResultDesc: "Error storing payment" });
@@ -80,7 +84,13 @@ app.post('/mpesa_confirmation', (req, res) => {
 
     console.log('✅ Payment stored successfully.');
     // Publishing to MQTT topic
-    client.publish(topic, JSON.stringify({ first_name:fname,amount: amount }), { qos: 1 }, (err) => {
+    client.publish(topic, JSON.stringify({
+      first_name: fname,
+      middle_name: mname,
+      last_name: lname,
+      amount: amount,
+      pump_time_ms: Math.round(pumpRunTimeMs)
+    }), { qos: 1 }, (err) => {
       if (err) {
         console.log('Error publishing to MQTT:', err);
       } else {
