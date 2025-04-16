@@ -29,51 +29,77 @@ const client = mqtt.connect(mqttOptions);
 const topic = 'wuzu58mpesa_data';
 
 client.on('connect', () => {
-  console.log('Connected to MQTT broker');
+  console.log('✅ Connected to MQTT broker');
 });
 
 client.on('error', (err) => {
-  console.error('MQTT connection error:', err);
+  console.error('❌ MQTT connection error:', err);
 });
 
+// Persistent MySQL DB connection setup
+let db;
 
+function handleDisconnect() {
+  db = mysql.createConnection({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    port: process.env.DB_PORT || 3306
+  });
 
-// Create a database connection
-const db = mysql.createConnection({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  port: process.env.DB_PORT || 3306
-});
+  db.connect((err) => {
+    if (err) {
+      console.error('❌ Error connecting to DB:', err.message);
+      setTimeout(handleDisconnect, 2000); // Retry after delay
+    } else {
+      console.log('✅ Connected to the database.');
+    }
+  });
 
-// Connect to the database
-db.connect((err) => {
-  if (err) {
-    console.error('❌ Database connection failed:', err.message);
-    return;
+  db.on('error', (err) => {
+    console.error('⚠️ DB Error:', err.message);
+    if (err.code === 'PROTOCOL_CONNECTION_LOST' || err.fatal) {
+      console.log('🔄 Reconnecting to the database...');
+      handleDisconnect();
+    } else {
+      throw err;
+    }
+  });
+}
+
+// Call the DB connection handler
+handleDisconnect();
+
+// Optional: Keep connection alive by pinging every 60 seconds
+setInterval(() => {
+  if (db) {
+    db.ping((err) => {
+      if (err) {
+        console.error('❌ DB ping error:', err.message);
+      } else {
+        console.log('📶 DB ping successful');
+      }
+    });
   }
-  console.log('✅ Connected to the database.');
-});
+}, 60000);
 
-// M-Pesa Confirmation Endpoint (Insert Data into Database)
+// M-Pesa Confirmation Endpoint
 app.post('/mpesa_confirmation', (req, res) => {
   const data = req.body;
   const transaction_id = data.TransID;
   const transaction_time = data.TransTime;
   const amount = data.TransAmount;
   const phone_no = data.MSISDN;
-  const fname = data.FirstName || "Uknown";
-  const mname = data.MiddleName || "Uknown";
-  const lname = data.LastName || "Uknown";
+  const fname = data.FirstName || "Unknown";
+  const mname = data.MiddleName || "Unknown";
+  const lname = data.LastName || "Unknown";
 
   console.log(fname, mname, phone_no, transaction_id, transaction_time);
 
-  // Calculate pump run time in milliseconds
   const litres = amount / 60;
-  const pumpRunTimeMs = (litres / 0.02) * 1000; 
+  const pumpRunTimeMs = (litres / 0.02) * 1000;
 
-  // Store transaction in database
   const insertQuery = `INSERT INTO payments (transaction_id, amount, phone, fname, mname, lname) VALUES (?, ?, ?, ?, ?, ?)`;
 
   db.query(insertQuery, [transaction_id, amount, phone_no, fname, mname, lname], (err, result) => {
@@ -83,7 +109,6 @@ app.post('/mpesa_confirmation', (req, res) => {
     }
 
     console.log('✅ Payment stored successfully.');
-    // Publishing to MQTT topic
     client.publish(topic, JSON.stringify({
       first_name: fname,
       middle_name: mname,
@@ -92,9 +117,9 @@ app.post('/mpesa_confirmation', (req, res) => {
       pump_time_ms: Math.round(pumpRunTimeMs)
     }), { qos: 1 }, (err) => {
       if (err) {
-        console.log('Error publishing to MQTT:', err);
+        console.log('❌ Error publishing to MQTT:', err.message);
       } else {
-        console.log('Transaction data published to MQTT');
+        console.log('📡 Transaction data published to MQTT');
       }
     });
 
@@ -107,9 +132,8 @@ app.post('/mpesa_confirmation', (req, res) => {
 
 // M-Pesa Validation Endpoint
 app.post('/mpesa_validation', (req, res) => {
-  const dataVal = req.body;
-  const transaction_id = dataVal.TransID;
-  console.log(transaction_id);
+  const transaction_id = req.body.TransID;
+  console.log('🔍 Validation for transaction:', transaction_id);
   res.status(200).json({
     ResultCode: "0",
     ResultDesc: "Accepted"
