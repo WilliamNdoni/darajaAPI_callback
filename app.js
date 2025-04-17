@@ -85,7 +85,7 @@ setInterval(() => {
 }, 60000);
 
 // M-Pesa Confirmation Endpoint
-app.post('/mpesa_confirmation', (req, res) => {
+app.post('/milk_confirmation', (req, res) => {
   const data = req.body;
   const transaction_id = data.TransID;
   const transaction_time = data.TransTime;
@@ -131,7 +131,7 @@ app.post('/mpesa_confirmation', (req, res) => {
 });
 
 // M-Pesa Validation Endpoint
-app.post('/mpesa_validation', (req, res) => {
+app.post('/milk_validation', (req, res) => {
   const transaction_id = req.body.TransID;
   console.log('🔍 Validation for transaction:', transaction_id);
   res.status(200).json({
