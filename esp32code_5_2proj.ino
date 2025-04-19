@@ -5,6 +5,7 @@
 #include <SPIFFS.h>
 #include <LiquidCrystal_I2C.h>
 #include <Wire.h>
+#include <HTTPClient.h>
 
 // WiFi credentials
 const char* ssid = "Galaxy S21 FE";
@@ -18,14 +19,22 @@ const char* mqtt_password = "William77";
 const char* mqtt_client_id = "ESP32_MPESA_CLIENT";
 const char* mqtt_topic = "wuzu58mpesa_data";
 
+// Tiara Connect SMS API
+const char* sms_api_url = "https://api2.tiaraconnect.io/api/messaging/sendsms";
+const char* sms_auth_token = "Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiI1NTMiLCJvaWQiOjU1MywidWlkIjoiMjVhMTE5OTYtYTMwMy00ZDQ1LWFhNDEtNjIwMTllMzY0YTA2IiwiYXBpZCI6NTIyLCJpYXQiOjE3NDUwNjM3MjIsImV4cCI6MjA4NTA2MzcyMn0.kjbBwL5NUuDM-eI8t1dob326zHZxwxovXXro543BTKC3goP1Udf629z77N2_UTwZHqh836QiYKy12QA7Ic9nsw";
+
 // LCD Settings
 #define LCD_ADDRESS 0x27
 #define LCD_COLS 20
 #define LCD_ROWS 4
 LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLS, LCD_ROWS);
 
-WiFiClientSecure espClient;
-PubSubClient client(espClient);
+// Ultrasonic Sensor Pins
+const int trigPin = 12;
+const int echoPin = 14;
+
+// Milk level threshold (in cm)
+const float LOW_MILK_THRESHOLD = 30.0;
 
 // Queue definitions
 #define MAX_QUEUE_SIZE 5
@@ -57,6 +66,14 @@ const int relayPin = 5;
 unsigned long lastResetTime = 0;
 const unsigned long resetInterval = 6 * 60 * 60 * 1000;
 
+// Milk level check timer
+unsigned long lastMilkCheckTime = 0;
+const unsigned long milkCheckInterval = 60000; // Check every minute
+bool lowMilkAlertSent = false;
+
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
+
 void setup_wifi() {
   lcd.clear();
   lcd.setCursor(0, 0);
@@ -78,6 +95,75 @@ void setup_wifi() {
   lcd.print(WiFi.localIP());
   
   Serial.println("\nWiFi connected");
+}
+
+float getDistance() {
+  // Send ultrasonic pulse
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  // Measure echo duration
+  long duration = pulseIn(echoPin, HIGH);
+  
+  // Calculate distance in cm
+  float distance = duration * 0.034 / 2;
+  
+  Serial.print("Distance: ");
+  Serial.print(distance);
+  Serial.println(" cm");
+  
+  return distance;
+}
+
+void sendLowMilkAlert() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected - can't send SMS");
+    return;
+  }
+
+  HTTPClient http;
+  
+  http.begin(sms_api_url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", sms_auth_token);
+
+  String message = "ALERT: Milk level is low! Level (Distance from top): " + String(getDistance()) + "cm. Please refill!";
+  String payload = "{\"to\": \"+254797321147\", \"from\": \"CONNECT\", \"message\": \"" + message + "\"}";
+  
+  int httpResponseCode = http.POST(payload);
+  String response = http.getString();
+  
+  Serial.println("SMS Response code: " + String(httpResponseCode));
+  Serial.println("SMS Response: " + response);
+  
+  http.end();
+  
+  if (httpResponseCode == 200) {
+    lowMilkAlertSent = true;
+    Serial.println("Low milk alert sent via SMS");
+  }
+}
+
+void checkMilkLevel() {
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastMilkCheckTime >= milkCheckInterval) {
+    lastMilkCheckTime = currentTime;
+    
+    float distance = getDistance();
+    
+    if (distance > LOW_MILK_THRESHOLD) {
+      if (!lowMilkAlertSent) {
+        Serial.println("Milk level low! Sending alert...");
+        sendLowMilkAlert();
+      }
+    } else {
+      lowMilkAlertSent = false; // Reset alert if level is back to normal
+    }
+  }
 }
 
 void displayTransactionInfo(const char* firstName, float amount) {
@@ -375,6 +461,10 @@ void loadQueueFromSPIFFS() {
 }
 
 void setup() {
+  // Initialize ultrasonic sensor pins
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+
   if (!SPIFFS.begin(true)) {
     Serial.println("An Error has occurred while mounting SPIFFS");
     lcd.clear();
@@ -411,6 +501,9 @@ void loop() {
     reconnect();
   }
   client.loop();
+
+  // Check milk level periodically
+  checkMilkLevel();
 
   // Update countdown if active
   if (countdownActive) {
