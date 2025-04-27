@@ -3,7 +3,15 @@ const express = require('express');
 const mysql = require('mysql2');
 const mqtt = require('mqtt');
 require('dotenv').config();
-
+// Add this near the top of your server file, after require statements
+// const cors = require('cors');
+// app.use(cors({
+//   origin: 'http://localhost:3000', // or your frontend URL
+//   methods: ['GET', 'POST', 'OPTIONS'],
+//   allowedHeaders: ['Content-Type']
+// }));
+const cors = require('cors');
+app.use(cors());
 // Initializing the app
 const app = express();
 
