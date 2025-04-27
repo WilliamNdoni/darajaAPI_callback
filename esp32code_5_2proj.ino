@@ -2,6 +2,10 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <WiFiClientSecure.h>
+#include <SPIFFS.h>
+#include <LiquidCrystal_I2C.h>
+#include <Wire.h>
+#include <HTTPClient.h>
 
 // WiFi credentials
 const char* ssid = "Galaxy S21 FE";
@@ -10,136 +14,406 @@ const char* password = "william77";
 // MQTT Broker settings
 const char* mqtt_server = "4761eba0b4eb4a958f76528215b690db.s1.eu.hivemq.cloud";
 const int mqtt_port = 8883;
-const char* mqtt_username = "williamndoni"; // If required
-const char* mqtt_password = "William77"; // If required
+const char* mqtt_username = "williamndoni"; 
+const char* mqtt_password = "William77"; 
 const char* mqtt_client_id = "ESP32_MPESA_CLIENT";
 const char* mqtt_topic = "wuzu58mpesa_data";
 
-WiFiClientSecure espClient;
-PubSubClient client(espClient);
+// Tiara Connect SMS API
+const char* sms_api_url = "https://api2.tiaraconnect.io/api/messaging/sendsms";
+const char* sms_auth_token = "Bearer eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiI1NTMiLCJvaWQiOjU1MywidWlkIjoiMjVhMTE5OTYtYTMwMy00ZDQ1LWFhNDEtNjIwMTllMzY0YTA2IiwiYXBpZCI6NTIyLCJpYXQiOjE3NDUwNjM3MjIsImV4cCI6MjA4NTA2MzcyMn0.kjbBwL5NUuDM-eI8t1dob326zHZxwxovXXro543BTKC3goP1Udf629z77N2_UTwZHqh836QiYKy12QA7Ic9nsw";
+
+// LCD Settings
+#define LCD_ADDRESS 0x27
+#define LCD_COLS 20
+#define LCD_ROWS 4
+LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLS, LCD_ROWS);
+
+// Ultrasonic Sensor Pins
+const int trigPin = 12;
+const int echoPin = 14;
+
+// Milk level threshold (in cm)
+const float LOW_MILK_THRESHOLD = 30.0;
 
 // Queue definitions
 #define MAX_QUEUE_SIZE 5
 String messageQueue[MAX_QUEUE_SIZE];
 int queueHead = 0;
 int queueTail = 0;
-bool pumpRunning = false;  // Track if the pump is running
+bool pumpRunning = false; // Flag to check if the pump is running
 
-// Relay Pin (Adjust the GPIO pin if needed)
-const int relayPin = 5;  // Change this pin to the one controlling your relay
+// Non-blocking pump control variables
+unsigned long pumpStartTime = 0;
+unsigned long pumpDuration = 0;
+bool pumpActive = false;
+
+// Non-blocking countdown variables
+unsigned long countdownStartTime = 0;
+int countdownSeconds = 10;
+bool countdownActive = false;
+int currentCountdown = 0;
+bool displayedCountdown = false;
+
+// Current transaction info
+String currentFirstName = "";
+float currentAmount = 0;
+
+// Relay Pin
+const int relayPin = 5;
+
+// Reset timer (every 6 hours)
+unsigned long lastResetTime = 0;
+const unsigned long resetInterval = 6 * 60 * 60 * 1000;
+
+// Milk level check timer
+unsigned long lastMilkCheckTime = 0;
+const unsigned long milkCheckInterval = 60000; // Check every minute
+bool lowMilkAlertSent = false;
+
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
 
 void setup_wifi() {
-  delay(10);
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
-
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi...");
+  
+  Serial.println("Connecting to WiFi...");
   WiFi.begin(ssid, password);
-
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
+    lcd.print(".");
   }
-
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("WiFi connected!");
+  lcd.setCursor(0, 1);
+  lcd.print("IP: ");
+  lcd.print(WiFi.localIP());
+  
+  Serial.println("\nWiFi connected");
 }
 
-void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] ");
-
-  // Create buffer for the message
-  char message[length + 1];
-  for (int i = 0; i < length; i++) {
-    message[i] = (char)payload[i];
-  }
-  message[length] = '\0';
-
-  Serial.println(message);
-
-  // Add message to the queue
-  enqueueMessage(String(message));
+float getDistance() {
+  // Send ultrasonic pulse
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  // Measure echo duration
+  long duration = pulseIn(echoPin, HIGH);
+  
+  // Calculate distance in cm
+  float distance = duration * 0.034 / 2;
+  
+  Serial.print("Distance: ");
+  Serial.print(distance);
+  Serial.println(" cm");
+  
+  return distance;
 }
 
-void processTransaction(String message) {
-  DynamicJsonDocument doc(1024);
-  DeserializationError error = deserializeJson(doc, message);
-
-  if (error) {
-    Serial.print("deserializeJson() failed: ");
-    Serial.println(error.c_str());
+void sendLowMilkAlert() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected - can't send SMS");
     return;
   }
 
-  // Extract transaction details
-  const char* firstName = doc["first_name"];
-  const char* middleName = doc["middle_name"];
-  const char* lastName = doc["last_name"];
-  float amount = doc["amount"];
-  int pumpTimeMs = doc["pump_time_ms"];
+  HTTPClient http;
+  
+  http.begin(sms_api_url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", sms_auth_token);
 
-  Serial.println("Processing Transaction...");
-  Serial.print("First Name: ");
-  Serial.println(firstName);
-  Serial.print("Middle Name: ");
-  Serial.println(middleName);
-  Serial.print("Last Name: ");
-  Serial.println(lastName);
-  Serial.print("Amount: ");
-  Serial.println(amount);
-  Serial.print("Pump time: ");
-  Serial.println(pumpTimeMs);
+  String message = "ALERT: Milk level is low! Level (Distance from top): " + String(getDistance()) + "cm. Please refill!";
+  String payload = "{\"to\": \"+254797321147\", \"from\": \"CONNECT\", \"message\": \"" + message + "\"}";
+  
+  int httpResponseCode = http.POST(payload);
+  String response = http.getString();
+  
+  Serial.println("SMS Response code: " + String(httpResponseCode));
+  Serial.println("SMS Response: " + response);
+  
+  http.end();
+  
+  if (httpResponseCode == 200) {
+    lowMilkAlertSent = true;
+    Serial.println("Low milk alert sent via SMS");
+  }
+}
 
-  // Start pump if sufficient amount
-  if (amount >= 10) {
-    Serial.println("Starting pump...");
-    digitalWrite(relayPin, HIGH);  // Turn on the relay (pump)
-    delay(pumpTimeMs);             // Run pump for the time specified in the message
-    digitalWrite(relayPin, LOW);   // Turn off the relay (pump)
-    Serial.println("Transaction completed - Milk pumped");
+void checkMilkLevel() {
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastMilkCheckTime >= milkCheckInterval) {
+    lastMilkCheckTime = currentTime;
+    
+    float distance = getDistance();
+    
+    if (distance > LOW_MILK_THRESHOLD) {
+      if (!lowMilkAlertSent) {
+        Serial.println("Milk level low! Sending alert...");
+        sendLowMilkAlert();
+      }
+    } else {
+      lowMilkAlertSent = false; // Reset alert if level is back to normal
+    }
+  }
+}
+
+void displayTransactionInfo(const char* firstName, float amount) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Customer:");
+  lcd.setCursor(0, 1);
+  lcd.print(firstName);
+  
+  lcd.setCursor(0, 2);
+  lcd.print("Amount Paid:");
+  lcd.setCursor(0, 3);
+  lcd.print("KES ");
+  lcd.print(amount);
+}
+
+void startCountdown() {
+  lcd.clear();
+  
+  // Display customer name in the instruction
+  lcd.setCursor(0, 0);
+  lcd.print(currentFirstName);
+  lcd.print(", PLACE");
+  
+  lcd.setCursor(0, 1);
+  lcd.print("CONTAINER UNDER");
+  
+  lcd.setCursor(0, 2);
+  lcd.print("THE NOZZLE");
+  
+  countdownStartTime = millis();
+  countdownActive = true;
+  currentCountdown = countdownSeconds;
+  displayedCountdown = false;
+}
+
+void updateCountdown() {
+  if (!countdownActive) return;
+  
+  unsigned long elapsed = millis() - countdownStartTime;
+  int newCountdown = countdownSeconds - (elapsed / 1000);
+  
+  if (newCountdown != currentCountdown || !displayedCountdown) {
+    currentCountdown = newCountdown;
+    displayedCountdown = true;
+    
+    lcd.setCursor(9, 3);
+    lcd.print("    ");
+    lcd.setCursor(9, 3);
+    if (currentCountdown < 10) lcd.print(" ");
+    lcd.print(currentCountdown);
+    lcd.print("...");
+  }
+  
+  if (currentCountdown <= 0) {
+    countdownActive = false;
+    lcd.setCursor(0, 3);
+    lcd.print("STARTING PUMP...");
+    
+    // Start the pump after countdown
+    pumpStartTime = millis();
+    pumpDuration = calculatePumpTime(currentAmount);
+    pumpActive = true;
+    digitalWrite(relayPin, HIGH);
+    Serial.println("Starting pump for " + String(pumpDuration) + "ms");
+  }
+}
+
+int calculatePumpTime(float amount) {
+  float litres = amount / 60;
+  return (litres / 0.02) * 1000;
+}
+
+void showWelcomeMessage() {
+  lcd.clear();
+  lcd.setCursor(3, 0);
+  lcd.print("Welcome!");
+  lcd.setCursor(1, 1);
+  lcd.print("Pay to get your milk");
+}
+
+void printQueue() {
+  Serial.println("Current Queue:");
+  for (int i = queueHead; i != queueTail; i = (i + 1) % MAX_QUEUE_SIZE) {
+    Serial.print(i);
+    Serial.print(": ");
+    Serial.println(messageQueue[i]);
+  }
+  Serial.println("-------------------------");
+}
+
+void validateAndEnqueueMessage(String message) {
+  DynamicJsonDocument testDoc(1024);
+  DeserializationError error = deserializeJson(testDoc, message);
+  if (error) {
+    Serial.print("Invalid JSON message received: ");
+    Serial.println(error.c_str());
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Invalid message");
+    lcd.setCursor(0, 1);
+    lcd.print("Rejected");
+    delay(2000);
+    return;
+  }
+  
+  if (!testDoc.containsKey("first_name") || !testDoc.containsKey("amount") || !testDoc.containsKey("pump_time_ms")) {
+    Serial.println("Message missing required fields");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Invalid data");
+    lcd.setCursor(0, 1);
+    lcd.print("Missing fields");
+    delay(2000);
+    return;
+  }
+
+  enqueueMessage(message);
+}
+
+void enqueueMessage(String message) {
+  if ((queueTail + 1) % MAX_QUEUE_SIZE == queueHead) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Queue full!");
+    lcd.setCursor(0, 1);
+    lcd.print("Message dropped");
+    delay(2000);
+    Serial.println("Queue is full. Message dropped.");
+    return;
+  }
+
+  messageQueue[queueTail] = message;
+  queueTail = (queueTail + 1) % MAX_QUEUE_SIZE;
+  saveQueueToSPIFFS();
+
+  Serial.println("Message added to queue.");
+  printQueue();
+
+  if (!pumpRunning && !pumpActive && !countdownActive) {
+    Serial.println("Starting to process new transaction");
+    processNextTransaction();
   } else {
-    Serial.println("Insufficient payment. Skipping...");
+    Serial.println("System busy, transaction queued for later processing");
   }
+}
 
-  // After pump finishes, process next message if any
-  pumpRunning = false;
-  if (queueHead != queueTail) {
-    // Dequeue the next message and process it
-    String nextMessage = dequeueMessage();
-    pumpRunning = true;
-    processTransaction(nextMessage);
+void processNextTransaction() {
+  if (queueHead == queueTail) {
+    pumpRunning = false;
+    Serial.println("Queue empty, no transactions to process");
+    showWelcomeMessage();
+    return;
   }
+  
+  pumpRunning = true;
+  String message = messageQueue[queueHead];
+  startTransaction(message);
 }
 
 String dequeueMessage() {
   if (queueHead == queueTail) {
     Serial.println("Queue is empty.");
-    return "";  // No messages in the queue
+    return "";
   }
 
   String message = messageQueue[queueHead];
-
-  // Clear the processed message from the queue
-  messageQueue[queueHead] = "";  // Delete the message by replacing with empty string
-
-  // Move the head to the next position
   queueHead = (queueHead + 1) % MAX_QUEUE_SIZE;
+  saveQueueToSPIFFS();
+
+  Serial.println("Dequeued Message:");
+  Serial.println(message);
+  printQueue();
 
   return message;
 }
 
-void enqueueMessage(String message) {
-  if ((queueTail + 1) % MAX_QUEUE_SIZE == queueHead) {
-    Serial.println("Queue is full. Message dropped.");
-    return;  // Queue is full, drop the message
+void callback(char* topic, byte* payload, unsigned int length) {
+  lcd.backlight();
+  Serial.print("MQTT Message Arrived [");
+  Serial.print(topic);
+  Serial.print("]: ");
+
+  String receivedMessage = "";
+  for (int i = 0; i < length; i++) {
+    receivedMessage += (char)payload[i];
   }
-  messageQueue[queueTail] = message;
-  queueTail = (queueTail + 1) % MAX_QUEUE_SIZE;
-  Serial.println("Message added to the queue.");
+  Serial.println(receivedMessage);
+
+  validateAndEnqueueMessage(receivedMessage);
+}
+
+void startTransaction(String message) {
+  Serial.println("Starting Transaction:");
+  Serial.println(message);
+
+  if (message.length() < 5) {
+    Serial.println("Message too short or empty, skipping");
+    dequeueMessage();
+    pumpRunning = false;
+    processNextTransaction();
+    return;
+  }
+
+  DynamicJsonDocument doc(1024);
+  DeserializationError error = deserializeJson(doc, message);
+
+  if (error) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("JSON Error:");
+    lcd.setCursor(0, 1);
+    lcd.print(error.c_str());
+    delay(2000);
+    Serial.print("JSON parsing failed: ");
+    Serial.println(error.c_str());
+    dequeueMessage();
+    pumpRunning = false;
+    processNextTransaction();
+    return;
+  }
+
+  currentFirstName = doc["first_name"].as<String>();
+  currentAmount = doc["amount"];
+
+  displayTransactionInfo(currentFirstName.c_str(), currentAmount);
+
+  if (currentAmount >= 10) {
+    startCountdown();
+  } else {
+    Serial.println("Insufficient funds. No pumping.");
+    dequeueMessage();
+    pumpRunning = false;
+    processNextTransaction();
+  }
+}
+
+void finishTransaction() {
+  Serial.println("Transaction complete.");
+  dequeueMessage();
+  pumpRunning = false;
+    
+  // Check for more transactions
+  if (queueHead != queueTail) {
+    Serial.println("Processing next transaction in queue");
+    processNextTransaction();
+  } else {
+    Serial.println("Queue empty, showing welcome message");
+    showWelcomeMessage();
+  }
 }
 
 void reconnect() {
@@ -147,7 +421,7 @@ void reconnect() {
     Serial.print("Attempting MQTT connection...");
     if (client.connect(mqtt_client_id, mqtt_username, mqtt_password)) {
       Serial.println("connected");
-      client.subscribe(mqtt_topic, 1);
+      client.subscribe(mqtt_topic);
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -157,28 +431,100 @@ void reconnect() {
   }
 }
 
+void saveQueueToSPIFFS() {
+  File file = SPIFFS.open("/queue.txt", "w");
+  if (!file) {
+    Serial.println("Failed to save queue!");
+    return;
+  }
+
+  for (int i = queueHead; i != queueTail; i = (i + 1) % MAX_QUEUE_SIZE) {
+    file.println(messageQueue[i]);
+  }
+
+  file.close();
+}
+
+void loadQueueFromSPIFFS() {
+  File file = SPIFFS.open("/queue.txt", "r");
+  if (!file) {
+    Serial.println("Failed to open queue for reading!");
+    return;
+  }
+
+  while (file.available()) {
+    String message = file.readStringUntil('\n');
+    validateAndEnqueueMessage(message);
+  }
+
+  file.close();
+}
+
 void setup() {
+  // Initialize ultrasonic sensor pins
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("An Error has occurred while mounting SPIFFS");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("SPIFFS Error!");
+    delay(2000);
+    return;
+  }
+
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, LOW);
+  lcd.init();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Initializing...");
+
   Serial.begin(115200);
   setup_wifi();
+  
   espClient.setInsecure();
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
 
-  pinMode(relayPin, OUTPUT);  // Set the relay pin as output
-  digitalWrite(relayPin, LOW); // Ensure the relay is off initially
+  loadQueueFromSPIFFS();
+
+  if (queueHead == queueTail) {
+    showWelcomeMessage();
+  }
 }
 
 void loop() {
+  // Handle MQTT connection
   if (!client.connected()) {
     reconnect();
   }
-
   client.loop();
 
-  if (!pumpRunning && queueHead != queueTail) {
-    // If pump is not running, process the next message in the queue
-    String nextMessage = dequeueMessage();
-    pumpRunning = true;
-    processTransaction(nextMessage);
+  // Check milk level periodically
+  checkMilkLevel();
+
+  // Update countdown if active
+  if (countdownActive) {
+    updateCountdown();
+  }
+
+  // Check pump status
+  if (pumpActive && (millis() - pumpStartTime >= pumpDuration)) {
+    digitalWrite(relayPin, LOW);
+    pumpActive = false;
+    Serial.println("Milk pumping completed.");
+    finishTransaction();
+  }
+
+  // Periodic queue reset
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastResetTime >= resetInterval) {
+    Serial.println("Resetting Queue...");
+    lastResetTime = currentMillis;
+    queueHead = queueTail = 0;
+    saveQueueToSPIFFS();
+    showWelcomeMessage();
   }
 }
